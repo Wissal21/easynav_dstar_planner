@@ -1,0 +1,9 @@
+<class_libraries>
+  <library path="easynav_dstar_planner">
+    <class name="easynav_dstar_planner/DStarPlanner"  type="easynav::DStarPlanner" base_class_type="easynav::PlannerMethodBase">
+      <description>
+      An implementation of D* 
+      </description>
+    </class>
+  </library>
+</class_libraries>
