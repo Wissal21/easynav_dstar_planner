@@ -22,6 +22,7 @@
 
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <cmath>
 #include <limits>
 #include <tuple>
@@ -96,6 +97,7 @@ std::expected<void, std::string> DStarPlanner::on_initialize()
 
 void DStarPlanner::update(NavState & nav_state)
 {
+  const auto previous_poses = current_path_.poses;
   current_path_.poses.clear();
   if (!nav_state.has("goals") || !nav_state.has("robot_pose") || !nav_state.has("map.dynamic")) {
     return;
@@ -136,6 +138,58 @@ void DStarPlanner::update(NavState & nav_state)
 
   auto poses = d_star_path(map, robot_pose.pose.pose, goal);
   if (!poses.empty()) {
+    std::unordered_set<int> previous_route;
+    for (const auto & pose_stamped : previous_poses) {
+      unsigned int mx, my;
+      const auto & position = pose_stamped.pose.position;
+      if (map.worldToMap(position.x, position.y, mx, my)) {
+        previous_route.insert(static_cast<int>(my * map.getSizeInCellsX() + mx));
+      }
+    }
+
+    std::unordered_set<int> current_route;
+    size_t elevated_cost_cells = 0;
+    unsigned int max_cell_cost = 0;
+    double sum_cell_cost = 0.0;
+    double route_length = 0.0;
+    for (size_t i = 0; i < poses.size(); ++i) {
+      const auto & position = poses[i].position;
+      unsigned int mx, my;
+      if (map.worldToMap(position.x, position.y, mx, my)) {
+        const int cell_id = static_cast<int>(my * map.getSizeInCellsX() + mx);
+        current_route.insert(cell_id);
+        const unsigned int cell_cost = map.getCost(mx, my);
+        max_cell_cost = std::max(max_cell_cost, cell_cost);
+        sum_cell_cost += cell_cost;
+        if (cell_cost >= INSCRIBED_INFLATED_OBSTACLE) {
+          ++elevated_cost_cells;
+        }
+      }
+      if (i > 0) {
+        const auto & previous = poses[i - 1].position;
+        route_length += std::hypot(
+          position.x - previous.x, position.y - previous.y);
+      }
+    }
+
+    size_t shared_cells = 0;
+    for (const int cell_id : current_route) {
+      if (previous_route.count(cell_id) > 0) {++shared_cells;}
+    }
+    const double route_overlap = current_route.empty() ? 0.0 :
+      100.0 * static_cast<double>(shared_cells) / current_route.size();
+    const double mean_cell_cost = current_route.empty() ? 0.0 :
+      sum_cell_cost / current_route.size();
+    const bool same_route = current_route == previous_route;
+
+    RCLCPP_INFO_THROTTLE(
+      get_node()->get_logger(), *get_node()->get_clock(), 5000,
+      "D* diagnóstico: ruta=%zu celdas, %.2fm; solapamiento previo=%.0f%% (%s); "
+      "coste medio/máximo=%.1f/%u, celdas >=253=%zu",
+      current_route.size(), route_length, route_overlap,
+      same_route ? "estable" : "cambió", mean_cell_cost, max_cell_cost,
+      elevated_cost_cells);
+
     current_path_.header.stamp = get_node()->now();
     current_path_.header.frame_id = goals.header.frame_id;
     for (const auto & pose : poses) {
@@ -166,9 +220,12 @@ std::vector<geometry_msgs::msg::Pose> DStarPlanner::d_star_path(
 
   int current_start_id = sy * map_width_ + sx;
   int current_goal_id = gy * map_width_ + gx;
+  const bool goal_changed = current_goal_id != goal_id_;
+  size_t changed_cost_cells = 0;
+  double start_shift_cells = 0.0;
 
   // Objetivo nuevo?
-  if (current_goal_id != goal_id_) {
+  if (goal_changed) {
     initialize_dstar(current_start_id, current_goal_id);
     last_known_costmap_.clear();
     
@@ -180,6 +237,7 @@ std::vector<geometry_msgs::msg::Pose> DStarPlanner::d_star_path(
   } else {
     int last_start_id = start_id_;
     start_id_ = current_start_id;
+    start_shift_cells = heuristic_id(last_start_id, start_id_, map_width_);
     
     // Cambios?
     bool map_changed = false;
@@ -197,6 +255,7 @@ std::vector<geometry_msgs::msg::Pose> DStarPlanner::d_star_path(
 
         // Cambia el coste de una celda -> obstaculo nuevo
         if (current_cost != last_cost) {
+          ++changed_cost_cells;
           if (!map_changed) {
             km_ += heuristic_id(last_start_id, start_id_, map_width_);
             map_changed = true;
@@ -213,6 +272,15 @@ std::vector<geometry_msgs::msg::Pose> DStarPlanner::d_star_path(
   }
 
   compute_shortest_path(map);
+
+  if (goal_changed || changed_cost_cells > 0) {
+    RCLCPP_INFO(
+      get_node()->get_logger(),
+      "D* entrada: meta_%s, celdas_costmap_cambiadas=%zu, movimiento_inicio=%.2f celdas, "
+      "km=%.2f, cola=%zu",
+      goal_changed ? "nueva" : "igual", changed_cost_cells,
+      start_shift_cells, km_, open_list_.size());
+  }
 
   std::vector<geometry_msgs::msg::Pose> path;
   int curr_id = start_id_;
